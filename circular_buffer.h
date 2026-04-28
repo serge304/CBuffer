@@ -54,106 +54,121 @@ struct is_buffer_compatible : std::integral_constant<bool,
     has_abs<T>::value
 > {};
 
-template<class T, size_t N>
-class circular_iterator
-{
-public:
-    using iterator_category = std::forward_iterator_tag;
-    using value_type = T;
-    using difference_type = std::ptrdiff_t;
-    using pointer = T*;
-    using reference = T&;
-
-public:
-    // Универсальный конструктор работает и для const, и для non-const T
-    // Если T = const U, то buffer будет const std::array<const U, N>&
-    circular_iterator(const std::array<typename std::remove_const<T>::type, N>& buffer,
-                      size_t index, size_t count, size_t total)
-        : mBuffer(&buffer), mIndex(index), mCount(count), mTotal(total)
-    {}
-
-private:
-    const std::array<typename std::remove_const<T>::type, N>* mBuffer;
-    size_t mIndex;   // Текущий индекс в массиве (0..N-1)
-    size_t mCount;   // Сколько элементов уже пройдено
-    size_t mTotal;   // Общее количество элементов для итерации
-
-public:
-    circular_iterator& operator++() noexcept
-    {
-        if (mCount >= mTotal) {
-            return *this;
-        }
-        mIndex = (mIndex + 1) % N;
-        ++mCount;
-        return *this;
-    }
-
-    circular_iterator operator++(int) noexcept
-    {
-        circular_iterator tmp(*this);
-        operator++();
-        return tmp;
-    }
-
-    // Сравнение по счетчику пройденных элементов, а не по индексу
-    bool operator==(const circular_iterator& rhs) const noexcept
-    {
-        return mCount == rhs.mCount;
-    }
-
-    bool operator!=(const circular_iterator& rhs) const noexcept
-    {
-        return !(*this == rhs);
-    }
-
-    reference operator*() const noexcept
-    {
-        // Безопасное приведение: если T const, то и buffer const, cast убирает const с указателя на элемент
-        return const_cast<reference>((*mBuffer)[mIndex]);
-    }
-
-    pointer operator->() const noexcept
-    {
-        return const_cast<pointer>(&(*mBuffer)[mIndex]);
-    }
-};
-
 template<typename T, size_t N, typename std::enable_if<is_buffer_compatible<T>::value, bool>::type = true>
 class circular_buffer
 {
 public:
-        // Стандартные алиасы типов для интеграции со STL
+    // Стандартные алиасы типов для интеграции со STL
+    using value_type = T;
+    using reference = T&;
+    using const_reference = const T&;
+    using pointer = T*;
+    using const_pointer = const T*;
+    using size_type = std::size_t;
+    using difference_type = std::ptrdiff_t;
+
+    class iterator
+    {
+    public:
+        using iterator_category = std::forward_iterator_tag;
         using value_type = T;
-        using reference = T&;
-        using const_reference = const T&;
-        using pointer = T*;
-        using const_pointer = const T*;
-        using size_type = std::size_t;
         using difference_type = std::ptrdiff_t;
-        using iterator = circular_iterator<T, N>;
-        using const_iterator = circular_iterator<const T, N>;
+        using pointer = T*;
+        using reference = T&;
+
+    private:
+        const circular_buffer* mBuffer;
+        size_t mIndex;   // Текущий индекс в массиве (0..N-1)
+        size_t mCount;   // Сколько элементов уже пройдено
+
+    public:
+        iterator(const circular_buffer* buffer, size_t index, size_t count)
+            : mBuffer(buffer), mIndex(index), mCount(count)
+        {}
+
+        iterator& operator++() noexcept
+        {
+            mIndex = (mIndex + 1) % N;
+            ++mCount;
+            return *this;
+        }
+
+        iterator operator++(int) noexcept
+        {
+            iterator tmp(*this);
+            ++(*this);
+            return tmp;
+        }
+
+        bool operator==(const iterator& rhs) const noexcept
+        {
+            return mCount == rhs.mCount;
+        }
+
+        bool operator!=(const iterator& rhs) const noexcept
+        {
+            return !(*this == rhs);
+        }
+
+        reference operator*() const noexcept
+        {
+            return const_cast<reference>(mBuffer->mBuff[mIndex]);
+        }
+
+        pointer operator->() const noexcept
+        {
+            return const_cast<pointer>(&mBuffer->mBuff[mIndex]);
+        }
+    };
+
+    using const_iterator = iterator;
 
 private:
-        using storage_t = std::array<T, N>;
-        storage_t mBuff{};
-        size_t mHead{}; // указатель на следующий свободный слот для записи
-        size_t mTail{}; // указатель на самый старый элемент
-        bool mFull{};   // флаг заполненности буфера
+    using storage_t = std::array<T, N>;
+    storage_t mBuff{};
+    size_t mHead{}; // указатель на следующий свободный слот для записи
+    size_t mTail{}; // указатель на самый старый элемент
+    bool mFull{};   // флаг заполненности буфера
 
-        T mSum{};
+    T mSum{};
 
 public:
-        // Non-const версии создают итераторы напрямую, а не через const_cast
-        iterator begin() noexcept       { return iterator(mBuff, mTail, 0, size()); }
-        iterator end() noexcept         { return iterator(mBuff, (mTail + size()) % N, size(), size()); }
+    /**
+     * Возвращает итератор на первый элемент буфера.
+     *
+     * Логика получения begin():
+     * - mTail указывает на самый старый элемент в буфере (первый для обхода)
+     * - Начальный индекс итератора = mTail
+     * - Счётчик пройденных элементов = 0 (начало обзора)
+     *
+     * Пример: если буфер содержит [5, 1, 3] (где 5 - самый старый),
+     * то begin() вернёт итератор, указывающий на элемент 5.
+     */
+    iterator begin() noexcept       { return iterator(this, mTail, 0); }
 
-        const_iterator begin() const noexcept { return const_iterator(mBuff, mTail, 0, size()); }
-        const_iterator end()   const noexcept { return const_iterator(mBuff, (mTail + size()) % N, size(), size()); }
+    /**
+     * Возвращает итератор, указывающий на позицию ПОСЛЕ последнего элемента.
+     *
+     * Логика получения end():
+     * - size() возвращает текущее количество элементов в буфере
+     * - Конечный индекс = (mTail + size()) % N
+     *   Это вычисляет позицию сразу за последним элементом с учётом цикличности
+     * - Счётчик пройденных элементов = size() (все элементы пройдены)
+     *
+     * Пример: если буфер размером 5 содержит [5, 1, 3] (size=3),
+     * и mTail=2, то end() будет указывать на индекс (2+3)%5=0,
+     * а счётчик будет равен 3 (количество элементов).
+     *
+     * Важно: сравнение итераторов происходит по счётчику mCount,
+     * поэтому итератор достигнет end(), когда пройдёт ровно size() элементов.
+     */
+    iterator end() noexcept         { return iterator(this, (mTail + size()) % N, size()); }
 
-        // Для совместимости с range-based for в const контексте
-        const_iterator cbegin() const noexcept { return begin(); }
-        const_iterator cend()   const noexcept { return end(); }
+    const_iterator begin() const noexcept { return const_iterator(this, mTail, 0); }
+    const_iterator end()   const noexcept { return const_iterator(this, (mTail + size()) % N, size()); }
+
+    const_iterator cbegin() const noexcept { return begin(); }
+    const_iterator cend()   const noexcept { return end(); }
 
 public:
         void reset() noexcept
