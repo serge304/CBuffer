@@ -15,182 +15,256 @@
 #include <type_traits>
 #include <array>
 #include <algorithm>
+#include <iterator>
+#include <cmath>
+
+// Хелперы для проверки наличия операторов (SFINAE для C++14)
+template<typename T, typename = void>
+struct has_plus : std::false_type {};
+
+template<typename T>
+struct has_plus<T, decltype(std::declval<T&>() + std::declval<T&>(), void())> : std::true_type {};
+
+template<typename T, typename = void>
+struct has_minus : std::false_type {};
+
+template<typename T>
+struct has_minus<T, decltype(std::declval<T&>() - std::declval<T&>(), void())> : std::true_type {};
+
+template<typename T, typename = void>
+struct has_less : std::false_type {};
+
+template<typename T>
+struct has_less<T, decltype(std::declval<T&>() < std::declval<T&>(), void())> : std::true_type {};
+
+template<typename T, typename = void>
+struct has_abs : std::false_type {};
+
+template<typename T>
+struct has_abs<T, decltype(std::abs(std::declval<T&>()), void())> : std::true_type {};
+
+// Комплексная проверка: тип должен быть копируемым и иметь нужные операторы
+template<typename T>
+struct is_buffer_compatible : std::integral_constant<bool,
+    std::is_copy_constructible<T>::value &&
+    std::is_copy_assignable<T>::value &&
+    has_plus<T>::value &&
+    has_minus<T>::value &&
+    has_less<T>::value &&
+    has_abs<T>::value
+> {};
 
 template<class T, size_t N>
-    class circular_iterator
+class circular_iterator
 {
 public:
-    using iterator_category = std::input_iterator_tag;
+    using iterator_category = std::forward_iterator_tag;
     using value_type = T;
     using difference_type = std::ptrdiff_t;
     using pointer = T*;
     using reference = T&;
 
 public:
-    circular_iterator(pointer _data, size_t _ndx)
-        : mData(_data), mNdx(_ndx)
+    // Универсальный конструктор работает и для const, и для non-const T
+    // Если T = const U, то buffer будет const std::array<const U, N>&
+    circular_iterator(const std::array<typename std::remove_const<T>::type, N>& buffer,
+                      size_t index, size_t count, size_t total)
+        : mBuffer(&buffer), mIndex(index), mCount(count), mTotal(total)
     {}
 
 private:
-    pointer mData;
-	size_t mNdx;
+    const std::array<typename std::remove_const<T>::type, N>* mBuffer;
+    size_t mIndex;   // Текущий индекс в массиве (0..N-1)
+    size_t mCount;   // Сколько элементов уже пройдено
+    size_t mTotal;   // Общее количество элементов для итерации
 
 public:
-    circular_iterator& operator++()
+    circular_iterator& operator++() noexcept
     {
-        ++mNdx;
-        if (mNdx == N)
-            mNdx = 0;
+        if (mCount >= mTotal) {
+            return *this;
+        }
+        mIndex = (mIndex + 1) % N;
+        ++mCount;
         return *this;
     }
 
-    circular_iterator operator++(int)
+    circular_iterator operator++(int) noexcept
     {
         circular_iterator tmp(*this);
         operator++();
         return tmp;
     }
 
-    bool operator==(const circular_iterator& rhs) const
+    // Сравнение по счетчику пройденных элементов, а не по индексу
+    bool operator==(const circular_iterator& rhs) const noexcept
     {
-        return mData == rhs.mData && mNdx == rhs.mNdx;
+        return mCount == rhs.mCount;
     }
 
-    bool operator!=(const circular_iterator& rhs) const
+    bool operator!=(const circular_iterator& rhs) const noexcept
     {
         return !(*this == rhs);
     }
 
-    reference operator*() const
+    reference operator*() const noexcept
     {
-        return mData[mNdx];
+        // Безопасное приведение: если T const, то и buffer const, cast убирает const с указателя на элемент
+        return const_cast<reference>((*mBuffer)[mIndex]);
+    }
+
+    pointer operator->() const noexcept
+    {
+        return const_cast<pointer>(&(*mBuffer)[mIndex]);
     }
 };
 
-template<typename T, size_t N, typename std::enable_if<std::is_arithmetic<T>::value, bool>::type = true>
+template<typename T, size_t N, typename std::enable_if<is_buffer_compatible<T>::value, bool>::type = true>
 class circular_buffer
 {
 public:
-	using storage_t = std::array<T, N>;
-	using iterator_t = circular_iterator<T, N>;
-	using const_iterator_t = circular_iterator<const T, N>;
+        // Стандартные алиасы типов для интеграции со STL
+        using value_type = T;
+        using reference = T&;
+        using const_reference = const T&;
+        using pointer = T*;
+        using const_pointer = const T*;
+        using size_type = std::size_t;
+        using difference_type = std::ptrdiff_t;
+        using iterator = circular_iterator<T, N>;
+        using const_iterator = circular_iterator<const T, N>;
 
 private:
-	storage_t mBuff{};
-	size_t mHead{}; // указатель на следующий свободный слот для записи     
-	size_t mTail{}; // указатель на самый старый элемент
-	bool mFull{};   // флаг заполненности буфера
+        using storage_t = std::array<T, N>;
+        storage_t mBuff{};
+        size_t mHead{}; // указатель на следующий свободный слот для записи
+        size_t mTail{}; // указатель на самый старый элемент
+        bool mFull{};   // флаг заполненности буфера
 
-	T mSum{};
-
-public:
-	auto begin()       { return       iterator_t(mBuff.data(), mTail); }
-	auto begin() const { return const_iterator_t(mBuff.data(), mTail); }
-
-	auto end()       { return       iterator_t(mBuff.data(), mHead); }
-	auto end() const { return const_iterator_t(mBuff.data(), mHead); }
+        T mSum{};
 
 public:
-	void reset()
-	{
-		mHead = 0;
-		mTail = 0;
-		mFull = false;
-		mSum = {};
-		mBuff = {};
-	}
+        // Non-const версии создают итераторы напрямую, а не через const_cast
+        iterator begin() noexcept       { return iterator(mBuff, mTail, 0, size()); }
+        iterator end() noexcept         { return iterator(mBuff, (mTail + size()) % N, size(), size()); }
 
-	bool full() const
-	{
-		return mFull;
-	}
+        const_iterator begin() const noexcept { return const_iterator(mBuff, mTail, 0, size()); }
+        const_iterator end()   const noexcept { return const_iterator(mBuff, (mTail + size()) % N, size(), size()); }
 
-	bool empty() const
-	{
-		return !mFull && (mHead == mTail);
-	}
+        // Для совместимости с range-based for в const контексте
+        const_iterator cbegin() const noexcept { return begin(); }
+        const_iterator cend()   const noexcept { return end(); }
 
-	size_t capacity() const
-	{
-		return N;
-	};
+public:
+        void reset() noexcept
+        {
+                mHead = 0;
+                mTail = 0;
+                mFull = false;
+                mSum = {};
+                mBuff = {};
+        }
 
-	size_t size() const
-	{
-		return mFull ?          N 
-		     : mHead >= mTail ? mHead - mTail
-			                  : N - mTail + mHead;
-	}
+        bool full() const noexcept
+        {
+                return mFull;
+        }
 
-	void push(T val)
-	{
-		if (capacity() == 0)
-			return;
+        bool empty() const noexcept
+        {
+                return !mFull && (mHead == mTail);
+        }
 
-		mSum += val;
-		if (full())
-			mSum -= mBuff[mTail];
+        size_t capacity() const noexcept
+        {
+                return N;
+        };
 
-		mBuff[mHead] = val;
+        size_t size() const noexcept
+        {
+                return mFull ?          N
+                     : mHead >= mTail ? mHead - mTail
+                                          : N - mTail + mHead;
+        }
 
-		if (mFull)
-			mTail = (mTail + 1) % N;
-		mHead = (mHead + 1) % N;
-		mFull = (mHead == mTail);		
-	}
+        void push(T val) noexcept
+        {
+                if (capacity() == 0)
+                        return;
 
-	T pop()
-	{
+                mSum += val;
+                if (full())
+                        mSum -= mBuff[mTail];
+
+                mBuff[mHead] = val;
+
+                if (mFull)
+                        mTail = (mTail + 1) % N;
+                mHead = (mHead + 1) % N;
+                mFull = (mHead == mTail);
+        }
+
+        T pop() noexcept
+        {
         if (empty())
-		    return T{}; 
+                    return T{};
 
         T val = mBuff[mTail];
-		mSum -= val;
+                mSum -= val;
         mTail = (mTail + 1) % N;
         mFull = false;  // после извлечения буфер точно не полон
         return val;
     }
 
-	int direction() const 
-	{
-		if (size() <= 1) return 0;
+        int direction() const noexcept
+        {
+                if (size() <= 1) return 0;
 
-		int trend = 0; // 0=неопределено, 1=возрастает, -1=убывает
+                int trend = 0; // 0=неопределено, 1=возрастает, -1=убывает
 
-		auto current_it = begin();
-		auto next_it = std::next(current_it);
+                auto current_it = begin();
+                auto next_it = std::next(current_it);
 
-		while (next_it != end()) {
-			auto current = *current_it++;
-			auto next = *next_it++;
+                while (next_it != end()) {
+                        auto current = *current_it++;
+                        auto next = *next_it++;
 
-			if (current < next) {
-				if (trend == -1) return 0; // направление изменилось
-				trend = 1;
-			} else if (current > next) {
-				if (trend == 1) return 0; // направление изменилось
-				trend = -1;
-			}
-			// Если current == next, оставляем trend без изменений
-		}
-		return trend;
-	}
+                        if (current < next) {
+                                if (trend == -1) return 0; // направление изменилось
+                                trend = 1;
+                        } else if (current > next) {
+                                if (trend == 1) return 0; // направление изменилось
+                                trend = -1;
+                        }
+                        // Если current == next, оставляем trend без изменений
+                }
+                return trend;
+        }
 
-	// самый старый добавленный элемент, будет удален при следующей вставке
-	T front() const { 
-		return empty() ? T{} : mBuff[mTail]; 
-	}
+        // самый старый добавленный элемент, будет удален при следующей вставке
+        T front() const noexcept {
+                return empty() ? T{} : mBuff[mTail];
+        }
 
-	// Последний добавленный элемент
-	T back()  const { 
-		return empty() ? T{} : mBuff[(mHead > 0 ? mHead : N) - 1]; 
-	}
+        // Последний добавленный элемент
+        T back()  const noexcept {
+                return empty() ? T{} : mBuff[(mHead > 0 ? mHead : N) - 1];
+        }
 
-	T sum() const { return mSum; }
-	T av() const { return size() > 0 ? mSum / size() : T{}; }
-	T min() const { return *(std::min_element(begin(), end())); }
-	T max() const { return *(std::max_element(begin(), end())); }
-	T spread() const { return std::abs(max() - min()); }
+        T sum() const noexcept { return mSum; }
+        T av() const noexcept { return size() > 0 ? mSum / size() : T{}; }
+        T min() const noexcept {
+                if (size() == 0) return T{};
+                return *(std::min_element(begin(), end()));
+        }
+        T max() const noexcept {
+                if (size() == 0) return T{};
+                return *(std::max_element(begin(), end()));
+        }
+        T spread() const noexcept {
+                if (size() == 0) return T{};
+                return std::abs(max() - min());
+        }
 };
 
 #endif /* SEQUENCE_H_ */
